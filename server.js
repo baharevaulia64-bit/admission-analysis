@@ -5,6 +5,8 @@ import XLSX from 'xlsx';
 import PDFDocument from 'pdfkit';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import iconv from 'iconv-lite';
+import PDFTable from 'pdfkit-table';
 import { existsSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,11 +15,15 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+// Настройка базы данных с поддержкой кириллицы
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'user',
-  password: process.env.DB_PASSWORD || 'password',
-  database: process.env.DB_NAME || 'database',
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
   charset: 'utf8mb4',
   waitForConnections: true,
   connectionLimit: 10,
@@ -25,10 +31,12 @@ const pool = mysql.createPool({
   timezone: 'Z'
 });
 
+// Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname)));
 
+// Middleware для правильной кодировки
 app.use((req, res, next) => {
   res.header('Content-Type', 'application/json; charset=utf-8');
   res.header('Access-Control-Allow-Origin', '*');
@@ -36,75 +44,103 @@ app.use((req, res, next) => {
   next();
 });
 
+// Функция для конвертации даты из 'DD.MM.YYYY' в 'YYYY-MM-DD'
 function convertDateFormat(dateStr) {
   if (!dateStr) return null;
   const parts = dateStr.split('.');
   if (parts.length === 3) {
     return `${parts[2]}-${parts[1]}-${parts[0]}`;
   }
-  return dateStr;
+  return dateStr; // Если уже в правильном формате
 }
 
+// Главная страница
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+// Загрузка файлов с поддержкой кириллицы — полная замена данных по программе
 app.post('/upload', upload.single('file'), async (req, res) => {
+  console.log('=== НАЧАЛО ЗАГРУЗКИ ===');
+
   let { program, date } = req.body;
   const filePath = req.file?.path;
 
+  // Конвертируем дату в формат БД (YYYY-MM-DD)
   date = convertDateFormat(date);
 
+  console.log('Программа:', program);
+  console.log('Конвертированная дата:', date);
+  console.log('Путь к файлу:', filePath);
+
   if (!program || !date || !filePath) {
+    console.error('Не хватает обязательных полей:', { program, date, filePath });
     return res.status(400).json({
       success: false,
       message: 'Не указана образовательная программа, дата или файл'
     });
   }
 
-  let connection;
-  try {
-    connection = await pool.getConnection();
+  async function executeUpload() {
+    let connection;
+    try {
+      connection = await pool.getConnection();
 
-    const [delPrior] = await connection.query(
-      'DELETE FROM priorities WHERE program_code = ?',
-      [program]
-    );
+      // ─────────────────────────────────────────────────────────────
+      // ★ ВАРИАНТ А: ПОЛНАЯ ЗАМЕНА ВСЕХ ДАННЫХ ПО ЭТОЙ ПРОГРАММЕ
+      // ─────────────────────────────────────────────────────────────
+      console.log(`[ЗАМЕНА ДАННЫХ] Полная очистка всех предыдущих записей по программе "${program}" ...`);
 
-    const [delEnroll] = await connection.query(
-      'DELETE FROM enrollment WHERE program_code = ?',
-      [program]
-    );
+      // 1. Удаляем ВСЕ приоритеты по этой программе (независимо от даты)
+      const [delPrior] = await connection.query(`
+        DELETE FROM priorities
+        WHERE program_code = ?
+      `, [program]);
+      console.log(`   → удалено из priorities: ${delPrior.affectedRows} строк`);
 
-    await connection.beginTransaction();
+      // 2. Удаляем ВСЕ результаты симуляций зачисления по этой программе
+      const [delEnroll] = await connection.query(`
+        DELETE FROM enrollment
+        WHERE program_code = ?
+      `, [program]);
+      console.log(`   → удалено из enrollment: ${delEnroll.affectedRows} строк`);
 
-    const workbook = XLSX.readFile(filePath, {
-      codepage: 65001,
-      cellDates: true,
-      cellNF: false,
-      cellStyles: false,
-      sheetStubs: false
-    });
 
-    const sheetName = workbook.SheetNames[0];
-    const worksheet = workbook.Sheets[sheetName];
+      console.log(`Очистка завершена. Теперь вставляем только новые данные из файла.`);
 
-    const jsonData = XLSX.utils.sheet_to_json(worksheet, {
-      raw: false,
-      defval: '',
-      blankrows: false
-    });
+      // Начинаем транзакцию для вставки новых данных
+      await connection.beginTransaction();
 
-    if (jsonData.length === 0) {
-      throw new Error('Файл пустой или имеет неправильный формат');
-    }
+      // ─────── Чтение Excel ───────
+      const workbook = XLSX.readFile(filePath, {
+        codepage: 65001,
+        cellDates: true,
+        cellNF: false,
+        cellStyles: false,
+        sheetStubs: false
+      });
 
-    let inserted = 0;
-    let updated = 0;
-    let errors = 0;
+      const sheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[sheetName];
 
-    for (const row of jsonData) {
-      try {
+      // Конвертируем лист в JSON
+      const jsonData = XLSX.utils.sheet_to_json(worksheet, {
+        raw: false,  // Обрабатываем как строки
+        defval: '',  // Пустые клетки как пустая строка
+        blankrows: false  // Игнорируем пустые строки
+      });
+
+      console.log('Прочитано строк из Excel:', jsonData.length);
+
+      if (jsonData.length === 0) {
+        throw new Error('Файл пустой или имеет неправильный формат');
+      }
+
+      let insertedApplicants = 0;
+      let insertedPriorities = 0;
+
+      for (const row of jsonData) {
+        // Находим ID абитуриента
         let id = null;
         const idKeys = ['ID', 'id', '№', 'ID абитуриента', 'Номер', 'Код', 'Абитуриент'];
 
@@ -116,10 +152,11 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         }
 
         if (!id || isNaN(id)) {
-          errors++;
+          console.warn('Пропуск строки без валидного ID:', row);
           continue;
         }
 
+        // Согласие
         let consent = 0;
         const consentKeys = ['Согласие', 'consent', 'Согласие на зачисление', 'Подписано'];
 
@@ -134,6 +171,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
           }
         }
 
+        // Приоритет
         let priority = null;
         const priKeys = ['Приоритет', 'priority', 'Номер приоритета'];
 
@@ -141,92 +179,192 @@ app.post('/upload', upload.single('file'), async (req, res) => {
           const val = row[key];
           if (val !== undefined && val !== null && val !== '') {
             priority = parseInt(String(val).trim());
-            if (!isNaN(priority) && priority >= 1 && priority <= 4) break;
+            if (!isNaN(priority)) break;
           }
         }
 
         if (priority === null) {
-          errors++;
+          console.warn('Пропуск строки без приоритета:', id, row);
           continue;
         }
 
-        const physics_ict  = parseInt(row['Физика/ИКТ'] || row['Physics/ICT'] || row['phys_ict'] || 0) || 0;
-        const russian      = parseInt(row['Русский язык'] || row['Russian'] || row['russian'] || 0) || 0;
-        const math         = parseInt(row['Математика'] || row['Math'] || row['math'] || 0) || 0;
-        const achievements = parseInt(row['Достижения'] || row['Индивидуальные достижения'] || row['Achievements'] || 0) || 0;
+        // Баллы по предметам
+        let physics_ict = 0;
+        const physKeys = ['Физика/ИКТ', 'physics_ict', 'Физика', 'ИКТ'];
+
+        for (const key of physKeys) {
+          const val = row[key];
+          if (val !== undefined && val !== null && val !== '') {
+            physics_ict = parseInt(String(val).trim()) || 0;
+            break;
+          }
+        }
+
+        let russian = 0;
+        const rusKeys = ['Русский', 'russian', 'Русский язык'];
+
+        for (const key of rusKeys) {
+          const val = row[key];
+          if (val !== undefined && val !== null && val !== '') {
+            russian = parseInt(String(val).trim()) || 0;
+            break;
+          }
+        }
+
+        let math = 0;
+        const mathKeys = ['Математика', 'math', 'Матем.'];
+
+        for (const key of mathKeys) {
+          const val = row[key];
+          if (val !== undefined && val !== null && val !== '') {
+            math = parseInt(String(val).trim()) || 0;
+            break;
+          }
+        }
+
+        let achievements = 0;
+        const achKeys = ['Достижения', 'achievements', 'Индивидуальные достижения', 'ИД'];
+
+        for (const key of achKeys) {
+          const val = row[key];
+          if (val !== undefined && val !== null && val !== '') {
+            achievements = parseInt(String(val).trim()) || 0;
+            break;
+          }
+        }
 
         const total = physics_ict + russian + math + achievements;
 
+        // Вставляем или обновляем абитуриента
         await connection.query(`
-          INSERT INTO applicants (
-            id, physics_ict, russian, math, achievements, total, consent, update_date
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO applicants (id, consent, physics_ict, russian, math, achievements, total, update_date)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON DUPLICATE KEY UPDATE
-            physics_ict   = VALUES(physics_ict),
-            russian       = VALUES(russian),
-            math          = VALUES(math),
-            achievements  = VALUES(achievements),
-            total         = VALUES(total),
-            consent       = VALUES(consent),
-            update_date   = VALUES(update_date)
-        `, [id, physics_ict, russian, math, achievements, total, consent, date]);
+            consent = VALUES(consent),
+            physics_ict = VALUES(physics_ict),
+            russian = VALUES(russian),
+            math = VALUES(math),
+            achievements = VALUES(achievements),
+            total = VALUES(total),
+            update_date = VALUES(update_date)
+        `, [id, consent, physics_ict, russian, math, achievements, total, date]);
 
-        const [rc] = await connection.query('SELECT ROW_COUNT() as cnt');
-        const affected = rc[0].cnt;
+        insertedApplicants++;
 
-        if (affected === 2) updated++;
-        else if (affected === 1) inserted++;
-
+        // Вставляем или обновляем приоритет
         await connection.query(`
           INSERT INTO priorities (applicant_id, program_code, priority, update_date)
           VALUES (?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            priority = VALUES(priority),
+            update_date = VALUES(update_date)
         `, [id, program, priority, date]);
 
-      } catch (rowErr) {
-        errors++;
+        insertedPriorities++;
+      }
+
+      await connection.commit();
+
+      console.log('Успешно вставлено/обновлено абитуриентов:', insertedApplicants);
+      console.log('Успешно вставлено/обновлено приоритетов:', insertedPriorities);
+
+      res.json({
+        success: true,
+        message: 'Данные успешно загружены и обновлены',
+        insertedApplicants,
+        insertedPriorities
+      });
+
+    } catch (err) {
+      if (connection) await connection.rollback();
+      throw err;
+    } finally {
+      if (connection) connection.release();
+    }
+  }
+
+  try {
+    let retries = MAX_RETRIES;
+    while (retries > 0) {
+      try {
+        await executeUpload();
+        break;
+      } catch (err) {
+        if (err.code === 'ER_LOCK_DEADLOCK') {
+          retries--;
+          console.warn(`Deadlock detected, retrying (${MAX_RETRIES - retries}/${MAX_RETRIES})...`);
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        } else {
+          throw err;
+        }
       }
     }
+    if (retries === 0) {
+      throw new Error('Max retries exceeded for deadlock');
+    }
+  } catch (err) {
+    console.error('Критическая ошибка загрузки:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Ошибка загрузки: ' + err.message
+    });
+  }
+});
+
+// Сброс базы данных
+app.post('/clear', async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    await connection.query('DELETE FROM enrollment');
+    await connection.query('DELETE FROM priorities');
+    await connection.query('DELETE FROM applicants');
+    await connection.query('DELETE FROM passing_scores');
 
     await connection.commit();
 
     res.json({
       success: true,
-      message: `Загрузка завершена. Вставлено: ${inserted}, Обновлено: ${updated}, Ошибок: ${errors}`
+      message: 'База данных успешно очищена'
     });
-
   } catch (err) {
     if (connection) await connection.rollback();
+    console.error('Ошибка очистки:', err);
     res.status(500).json({
       success: false,
-      message: 'Ошибка сервера при загрузке: ' + err.message
+      message: 'Ошибка очистки базы: ' + err.message
     });
   } finally {
     if (connection) connection.release();
   }
 });
 
+// Получение конкурсных списков
 app.get('/lists', async (req, res) => {
-  const { program, date, id, consent } = req.query;
-
+  let connection;
   try {
+    connection = await pool.getConnection();
     let query = `
       SELECT
         p.applicant_id AS id,
-        p.program_code AS program,
+        a.consent,
         p.priority,
         a.physics_ict,
         a.russian,
         a.math,
         a.achievements,
         a.total AS total_score,
-        a.consent,
+        p.program_code AS program,
         p.update_date AS date
       FROM priorities p
-      LEFT JOIN applicants a ON p.applicant_id = a.id AND p.update_date = a.update_date
+      JOIN applicants a ON p.applicant_id = a.id AND p.update_date = a.update_date
       WHERE 1=1
     `;
-
     const params = [];
+
+    const { program, date, id, consent } = req.query;
 
     if (program) {
       query += ' AND p.program_code = ?';
@@ -240,7 +378,7 @@ app.get('/lists', async (req, res) => {
 
     if (id) {
       query += ' AND p.applicant_id = ?';
-      params.push(id);
+      params.push(parseInt(id));
     }
 
     if (consent !== undefined && consent !== '') {
@@ -248,523 +386,402 @@ app.get('/lists', async (req, res) => {
       params.push(parseInt(consent));
     }
 
-    query += ' ORDER BY a.total DESC, p.applicant_id';
+    query += ' ORDER BY a.total DESC, p.priority ASC, p.applicant_id ASC';
 
-    const [rows] = await pool.query(query, params);
+    const [rows] = await connection.query(query, params);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-async function simulateEnrollment(date, connection) {
-  const [programsRows] = await connection.query('SELECT code, name, places FROM programs');
-
-  if (programsRows.length === 0) {
-    throw new Error('В базе данных нет программ');
-  }
-
-  const programs = programsRows.map(row => ({
-    code: row.code,
-    name: row.name,
-    places: row.places
-  }));
-
-  const placesLeft = {};
-  programs.forEach(prog => {
-    placesLeft[prog.code] = prog.places;
-  });
-
-  const [allApplicants] = await connection.query(`
-    SELECT
-      a.id,
-      a.total AS total_score,
-      a.consent
-    FROM applicants a
-    WHERE a.consent = 1
-      AND a.update_date = ?
-    ORDER BY a.total DESC, a.id ASC
-  `, [date]);
-
-  const enrolledIds = new Set();
-  let enrolledCount = 0;
-  let notEnrolledCount = 0;
-
-  for (const applicant of allApplicants) {
-    if (enrolledIds.has(applicant.id)) {
-      continue;
-    }
-
-    const [priorities] = await connection.query(`
-      SELECT
-        p.program_code,
-        p.priority
-      FROM priorities p
-      WHERE p.applicant_id = ?
-        AND p.update_date = ?
-      ORDER BY p.priority ASC
-    `, [applicant.id, date]);
-
-    if (priorities.length === 0) {
-      notEnrolledCount++;
-      continue;
-    }
-
-    let enrolled = false;
-
-    for (const priority of priorities) {
-      const programCode = priority.program_code;
-
-      if (placesLeft[programCode] > 0) {
-        await connection.query(`
-          INSERT INTO enrollment (applicant_id, program_code, priority, total_score, simulation_date)
-          VALUES (?, ?, ?, ?, ?)
-        `, [applicant.id, programCode, priority.priority, applicant.total_score, date]);
-
-        enrolledIds.add(applicant.id);
-        placesLeft[programCode]--;
-        enrolled = true;
-        enrolledCount++;
-        break;
-      }
-    }
-
-    if (!enrolled) {
-      notEnrolledCount++;
-    }
-  }
-
-  await savePassingScores(date, connection);
-
-  return { programs, placesLeft };
-}
-
-app.get('/calculate', async (req, res) => {
-  let { date } = req.query;
-  date = convertDateFormat(date);
-
-  if (!date) {
-    return res.status(400).json({ error: 'Не указана дата' });
-  }
-
-  let connection;
-  try {
-    connection = await pool.getConnection();
-
-    const [existing] = await connection.query(`
-      SELECT COUNT(*) as cnt
-      FROM passing_scores
-      WHERE calculation_date = ?
-    `, [date]);
-
-    const alreadyCalculated = existing[0].cnt > 0;
-
-    let passingScoresRows;
-
-    if (alreadyCalculated) {
-      [passingScoresRows] = await connection.query(`
-        SELECT
-          ps.*,
-          p.name as program_name,
-          p.places as total_places
-        FROM passing_scores ps
-        LEFT JOIN programs p ON ps.program_code = p.code
-        WHERE ps.calculation_date = ?
-        ORDER BY ps.program_code
-      `, [date]);
-    } else {
-      await connection.beginTransaction();
-
-      await connection.query('DELETE FROM enrollment WHERE simulation_date = ?', [date]);
-
-      const { programs } = await simulateEnrollment(date, connection);
-
-      await connection.commit();
-
-      [passingScoresRows] = await connection.query(`
-        SELECT
-          ps.*,
-          p.name as program_name,
-          p.places as total_places
-        FROM passing_scores ps
-        LEFT JOIN programs p ON ps.program_code = p.code
-        WHERE ps.calculation_date = ?
-        ORDER BY ps.program_code
-      `, [date]);
-    }
-
-    const passingScores = {};
-    const passingScoresTable = passingScoresRows.map(row => ({
-      program_code: row.program_code,
-      program_name: row.program_name || row.program_code,
-      passing_score: row.passing_score,
-      status: row.status,
-      calculation_date: row.calculation_date,
-      total_places: row.total_places
-    }));
-
-    passingScoresRows.forEach(row => {
-      if (row.status === 'НЕТ ДАННЫХ') {
-        passingScores[row.program_code] = 'НЕТ ДАННЫХ';
-      } else if (row.status === 'НЕДОБОР') {
-        passingScores[row.program_code] = 'НЕДОБОР';
-      } else {
-        passingScores[row.program_code] = row.passing_score ?? '—';
-      }
-    });
-
-    res.json({
-      passing_scores: passingScores,
-      passing_scores_table: passingScoresTable,
-      date: date,
-      total_programs: passingScoresRows.length,
-      from_cache: alreadyCalculated,
-      message: alreadyCalculated
-        ? `Данные взяты из кэша (уже рассчитаны ранее)`
-        : `Выполнена полная симуляция и расчёт проходных баллов`
-    });
-
-  } catch (err) {
-    if (connection) await connection.rollback();
-    res.status(500).json({
-      error: err.message,
-      details: 'Произошла ошибка при получении/расчёте проходных баллов'
-    });
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
-app.post('/clear-enrollment', async (req, res) => {
-  let connection;
-  try {
-    connection = await pool.getConnection();
-    await connection.query('DELETE FROM enrollment');
-    res.json({ success: true, message: 'Таблица enrollment очищена' });
-  } catch (err) {
+    console.error('Ошибка загрузки списков:', err);
     res.status(500).json({ error: err.message });
   } finally {
     if (connection) connection.release();
   }
 });
 
-app.get('/report', async (req, res) => {
-  let { date } = req.query;
-  date = convertDateFormat(date);
-
-  if (!date) {
-    return res.status(400).send('Не указана дата');
-  }
-
+// Получение доступных дат
+app.get('/available-dates', async (req, res) => {
   let connection;
   try {
     connection = await pool.getConnection();
-
-    const [enrollCheck] = await connection.query(
-      'SELECT COUNT(*) as count FROM enrollment WHERE simulation_date = ?',
-      [date]
-    );
-
-    if (enrollCheck[0].count === 0) {
-      return res.status(404).send('Нет данных о зачислении для указанной даты');
-    }
-
-    const [programsRows] = await connection.query(`
-      SELECT DISTINCT
-        e.program_code as code,
-        COALESCE(p.name, e.program_code) as name,
-        COALESCE(p.places, 0) as places
-      FROM enrollment e
-      LEFT JOIN programs p ON e.program_code = p.code
-      WHERE e.simulation_date = ?
-      ORDER BY e.program_code
-    `, [date]);
-
-    res.contentType("application/pdf");
-    res.setHeader('Content-Disposition', `attachment; filename=report_${date}.pdf`);
-
-    const doc = new PDFDocument({
-      margin: 50,
-      size: 'A4'
-    });
-
-    const fontPath = path.join(__dirname, 'fonts', 'NotoSans-Regular.ttf');
-    const fs = await import('fs');
-
-    let fontRegistered = false;
-    if (fs.existsSync(fontPath)) {
-      doc.registerFont('NotoSans', fontPath);
-      doc.font('NotoSans');
-      fontRegistered = true;
-    }
-
-    doc.pipe(res);
-
-    doc.fontSize(20).text('ОТЧЕТ ПО ПОСТУПЛЕНИЮ АБИТУРИЕНТОВ', 50, 100, { align: 'center' });
-    doc.fontSize(16).text(`Дата зачисления: ${date}`, 50, 150, { align: 'center' });
-    doc.fontSize(14).text(`Дата формирования: ${new Date().toLocaleString('ru-RU')}`, 50, 180, { align: 'center' });
-
-    let y = 250;
-
-    for (const prog of programsRows) {
-      const [enrolled] = await connection.query(`
-        SELECT applicant_id, priority, total_score
-        FROM enrollment
-        WHERE program_code = ? AND simulation_date = ?
-        ORDER BY total_score DESC, priority ASC, applicant_id ASC
-      `, [prog.code, date]);
-
-      if (enrolled.length > 0) {
-        doc.addPage();
-        if (fontRegistered) doc.font('NotoSans');
-        y = 60;
-
-        doc.fontSize(16).text(`Программа: ${prog.name} (${prog.code})`, 50, 50, { align: 'center' });
-        doc.fontSize(14).text(`Зачислено: ${enrolled.length} из ${prog.places} мест`, 50, y + 30, { align: 'center' });
-
-        y += 80;
-
-        doc.fontSize(10).text('№', 50, y);
-        doc.text('ID абитуриента', 80, y);
-        doc.text('Приоритет', 180, y);
-        doc.text('Сумма баллов', 250, y);
-
-        y += 20;
-        doc.moveTo(50, y).lineTo(350, y).stroke();
-        y += 10;
-
-        doc.fontSize(9);
-        enrolled.forEach((item, idx) => {
-          if (y > 720) {
-            doc.addPage();
-            if (fontRegistered) doc.font('NotoSans');
-            y = 50;
-          }
-
-          doc.text((idx + 1).toString(), 50, y);
-          doc.text(item.applicant_id.toString(), 80, y);
-          doc.text(item.priority.toString(), 180, y);
-          doc.text(item.total_score.toString(), 250, y);
-          y += 18;
-        });
-      }
-    }
-
-    const [passingScores] = await connection.query(`
-      SELECT ps.program_code, COALESCE(p.name, ps.program_code) as name, ps.passing_score, ps.status
-      FROM passing_scores ps
-      LEFT JOIN programs p ON ps.program_code = p.code
-      WHERE ps.calculation_date = ?
-      ORDER BY ps.program_code
-    `, [date]);
-
-    if (passingScores.length > 0) {
-      doc.addPage();
-      if (fontRegistered) doc.font('NotoSans');
-      y = 50;
-
-      doc.fontSize(18).text('Проходные баллы на текущую дату', 50, y, { align: 'center' });
-      y += 50;
-
-      doc.fontSize(12).text('Программа', 50, y);
-      doc.text('Проходной балл', 300, y);
-      doc.text('Статус', 450, y);
-      y += 25;
-
-      doc.moveTo(50, y).lineTo(550, y).stroke();
-      y += 15;
-
-      doc.fontSize(10);
-      passingScores.forEach((ps) => {
-        if (y > 720) {
-          doc.addPage();
-          if (fontRegistered) doc.font('NotoSans');
-          y = 50;
-        }
-
-        doc.text(`${ps.name} (${ps.program_code})`, 50, y);
-        doc.text(ps.passing_score ? ps.passing_score.toString() : '—', 300, y);
-        doc.text(ps.status, 450, y);
-        y += 20;
-      });
-    }
-
-    doc.end();
-
+    const [rows] = await connection.query(`
+      SELECT DISTINCT update_date
+      FROM applicants
+      ORDER BY update_date DESC
+    `);
+    res.json(rows.map(row => row.update_date));
   } catch (err) {
-    if (!res.headersSent) {
-      res.status(500).send('Ошибка формирования отчёта: ' + err.message);
-    }
+    console.error('Ошибка получения дат:', err);
+    res.status(500).json({ error: err.message });
   } finally {
     if (connection) connection.release();
   }
 });
 
-app.post('/clear', async (req, res) => {
+// Получение доступных программ
+app.get('/programs', async (req, res) => {
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    const [rows] = await connection.query('SELECT * FROM programs ORDER BY code');
+    res.json(rows);
+  } catch (err) {
+    console.error('Ошибка получения программ:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// Симуляция зачисления
+app.post('/simulate', async (req, res) => {
+  const { date } = req.body;
+
+  if (!date) {
+    return res.status(400).json({ error: 'Не указана дата симуляции' });
+  }
+
   let connection;
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    await connection.query('DELETE FROM enrollment');
-    await connection.query('DELETE FROM priorities');
-    await connection.query('DELETE FROM applicants');
-    await connection.query('DELETE FROM passing_scores');
+    // Очищаем предыдущие записи симуляции за эту дату
+    await connection.query('DELETE FROM enrollment WHERE simulation_date = ?', [date]);
+
+    // Получаем все программы
+    const [programs] = await connection.query('SELECT * FROM programs');
+
+    let totalEnrolled = 0;
+
+    // Для каждой программы
+    for (const prog of programs) {
+      const code = prog.code;
+      const places = prog.places;
+
+      // Получаем абитуриентов, подавших на эту программу с согласием
+      const [applicants] = await connection.query(`
+        SELECT
+          p.applicant_id AS id,
+          p.priority,
+          a.total
+        FROM priorities p
+        JOIN applicants a ON p.applicant_id = a.id AND p.update_date = a.update_date
+        WHERE p.program_code = ?
+          AND a.consent = 1
+          AND a.update_date = ?
+        ORDER BY a.total DESC, p.priority ASC, p.applicant_id ASC
+        LIMIT ?
+      `, [code, date, places]);
+
+      // Зачисляем
+      for (const app of applicants) {
+        await connection.query(`
+          INSERT INTO enrollment
+          (applicant_id, program_code, priority, total_score, simulation_date)
+          VALUES (?, ?, ?, ?, ?)
+        `, [app.id, code, app.priority, app.total, date]);
+
+        totalEnrolled++;
+      }
+    }
 
     await connection.commit();
-    res.json({ success: true, message: 'База данных полностью очищена' });
+
+    res.json({
+      success: true,
+      message: 'Симуляция зачисления успешно завершена',
+      enrolled: totalEnrolled
+    });
+
   } catch (err) {
     if (connection) await connection.rollback();
+    console.error('Ошибка симуляции:', err);
     res.status(500).json({ error: err.message });
   } finally {
     if (connection) connection.release();
   }
 });
 
-async function savePassingScores(date, connection) {
-  const [programsRows] = await connection.query('SELECT code, name, places FROM programs');
-  const programs = programsRows.map(row => ({
-    code: row.code,
-    name: row.name,
-    places: row.places
-  }));
+// Расчёт проходных баллов
+app.post('/calculate-passing', async (req, res) => {
+  const { date } = req.body;
 
-  for (const prog of programs) {
-    const code = prog.code;
-
-    const [enrollmentStats] = await connection.query(`
-      SELECT
-        MIN(total_score) AS min_score,
-        COUNT(*) AS enrolled_count
-      FROM enrollment
-      WHERE program_code = ? AND simulation_date = ?
-    `, [code, date]);
-
-    const { min_score, enrolled_count } = enrollmentStats[0] || { min_score: null, enrolled_count: 0 };
-
-    let passingScore = null;
-    let status = 'РАСЧИТАН';
-
-    if (enrolled_count === 0) {
-      status = 'НЕТ ДАННЫХ';
-    } else if (enrolled_count < prog.places) {
-      status = 'НЕДОБОР';
-      passingScore = min_score;
-    } else {
-      status = 'РАСЧИТАН';
-      passingScore = min_score;
-    }
-
-    await connection.query(`
-      INSERT INTO passing_scores (program_code, passing_score, status, calculation_date)
-      VALUES (?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        passing_score = VALUES(passing_score),
-        status = VALUES(status),
-        created_at = CURRENT_TIMESTAMP
-    `, [code, passingScore, status, date]);
+  if (!date) {
+    return res.status(400).json({ error: 'Не указана дата расчёта' });
   }
-}
 
-app.get('/all-applicants', async (req, res) => {
-  const { id, score, date } = req.query;
-
+  let connection;
   try {
-    let query = `
-      SELECT DISTINCT
-        a.id,
-        a.total,
-        a.update_date
-      FROM applicants a
-      INNER JOIN priorities p ON a.id = p.applicant_id
-        AND a.update_date = p.update_date
-      WHERE 1=1
-    `;
+    connection = await pool.getConnection();
 
-    const params = [];
+    // Получаем все программы
+    const [programs] = await connection.query('SELECT * FROM programs');
 
-    if (id) {
-      query += ' AND a.id = ?';
-      params.push(parseInt(id));
+    // Для каждой программы
+    for (const prog of programs) {
+      const code = prog.code;
+      const places = prog.places;
+
+      // Получаем минимальный балл среди зачисленных
+      const [minScoreRows] = await connection.query(`
+        SELECT MIN(total_score) as min_score
+        FROM enrollment
+        WHERE program_code = ? AND simulation_date = ?
+      `, [code, date]);
+
+      let status = 'НЕ ЗАЧИСЛЕНО';
+      let passingScore = null;
+
+      const min_score = minScoreRows[0].min_score;
+
+      if (min_score === null) {
+        status = 'НЕ ЗАЧИСЛЕНО';
+      } else if (min_score < 0) {
+        status = 'НЕ ЗАЧИСЛЕНО';
+      } else {
+        status = 'РАСЧИТАН';
+        passingScore = min_score;
+      }
+
+      // Используем INSERT ... ON DUPLICATE KEY UPDATE
+      await connection.query(`
+        INSERT INTO passing_scores (program_code, passing_score, status, calculation_date)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          passing_score = VALUES(passing_score),
+          status = VALUES(status),
+          created_at = CURRENT_TIMESTAMP
+      `, [code, passingScore, status, date]);
     }
-
-    if (score) {
-      query += ' AND a.total >= ?';
-      params.push(parseInt(score));
-    }
-
-    if (date) {
-      query += ' AND a.update_date = ?';
-      params.push(date);
-    }
-
-    query += ' ORDER BY a.total DESC, a.id ASC';
-
-    const [rows] = await pool.query(query, params);
-
-    const processedRows = rows.map(row => ({
-      id: row.id,
-      total: Number(row.total) || 0,
-      update_date: row.update_date
-    }));
-
-    res.json(processedRows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/applicant-details', async (req, res) => {
-  const { id } = req.query;
-
-  if (!id) {
-    return res.status(400).json({ error: 'Не указан ID абитуриента' });
-  }
-
-  try {
-    const [applicantRows] = await pool.query(
-      `SELECT
-        a.*
-      FROM applicants a
-      INNER JOIN priorities p ON a.id = p.applicant_id
-        AND a.update_date = p.update_date
-      WHERE a.id = ?
-      ORDER BY a.update_date DESC
-      LIMIT 1`,
-      [id]
-    );
-
-    if (applicantRows.length === 0) {
-      return res.status(404).json({ error: 'Абитуриент не найден или не имеет приоритетов' });
-    }
-
-    const [priorityRows] = await pool.query(`
-      SELECT
-        p.applicant_id,
-        p.program_code,
-        p.priority,
-        p.update_date,
-        pr.name as program_name
-      FROM priorities p
-      LEFT JOIN programs pr ON p.program_code = pr.code
-      WHERE p.applicant_id = ?
-      ORDER BY p.priority ASC, p.update_date DESC
-    `, [id]);
 
     res.json({
-      applicant: {
-        ...applicantRows[0],
-        consent: Boolean(applicantRows[0].consent)
-      },
-      priorities: priorityRows
+      success: true,
+      message: 'Проходные баллы успешно рассчитаны'
     });
 
   } catch (err) {
+    console.error('Ошибка расчёта:', err);
     res.status(500).json({ error: err.message });
+  } finally {
+    if (connection) connection.release();
   }
+});
+
+// Генерация PDF отчёта
+app.get('/report', async (req, res) => {
+  const { date } = req.query;
+
+  if (!date) {
+    return res.status(400).json({ error: 'Не указана дата отчёта' });
+  }
+
+  let connection;
+  try {
+    connection = await pool.getConnection();
+
+    // Получаем данные о проходных баллах
+    const [passingScores] = await connection.query(`
+      SELECT
+        ps.program_code,
+        pr.name as program_name,
+        ps.passing_score,
+        ps.status
+      FROM passing_scores ps
+      JOIN programs pr ON ps.program_code = pr.code
+      WHERE ps.calculation_date = ?
+      ORDER BY ps.program_code
+    `, [date]);
+
+    // Получаем данные о зачислениях
+    const [enrollments] = await connection.query(`
+      SELECT
+        e.applicant_id,
+        e.program_code,
+        e.priority,
+        e.total_score
+      FROM enrollment e
+      WHERE e.simulation_date = ?
+      ORDER BY e.program_code, e.total_score DESC
+    `, [date]);
+
+    // Создаём PDF
+    const doc = new PDFDocument({
+      size: 'A4',
+      margin: { top: 50, left: 50, right: 50, bottom: 50 },
+      info: {
+        Title: 'Отчёт о поступлении абитуриентов',
+        Author: 'Система анализа ВШЭ'
+      }
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="report_${date}.pdf"`);
+
+    doc.pipe(res);
+
+    // Шапка
+    doc.fontSize(20).text('Отчёт о поступлении абитуриентов', { align: 'center' });
+    doc.fontSize(14).text(`Дата: ${date}`, { align: 'center' });
+    doc.moveDown(2);
+
+    // Таблица проходных баллов
+    const passingTable = {
+      title: 'Проходные баллы по программам',
+      headers: ['Программа', 'Название', 'Проходной балл', 'Статус'],
+      rows: passingScores.map(ps => [
+        ps.program_code,
+        ps.program_name,
+        ps.passing_score || '—',
+        ps.status
+      ])
+    };
+
+    await doc.table(passingTable, {
+      prepareHeader: () => doc.font('Helvetica-Bold').fontSize(12),
+      prepareRow: () => doc.font('Helvetica').fontSize(10)
+    });
+
+    doc.moveDown(2);
+
+    // Таблица зачислений
+    const enrollmentTable = {
+      title: 'Зачисленные абитуриенты',
+      headers: ['ID абитуриента', 'Программа', 'Приоритет', 'Баллы'],
+      rows: enrollments.map(e => [
+        e.applicant_id,
+        e.program_code,
+        e.priority,
+        e.total_score
+      ])
+    };
+
+    await doc.table(enrollmentTable, {
+      prepareHeader: () => doc.font('Helvetica-Bold').fontSize(12),
+      prepareRow: () => doc.font('Helvetica').fontSize(10)
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error('Ошибка генерации отчёта:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// Получение списка всех уникальных абитуриентов с фильтрацией
+app.get('/all-applicants', async (req, res) => {
+    const { id, score, date } = req.query;
+
+    try {
+        // ИСПОЛЬЗУЕМ INNER JOIN с priorities чтобы получить только абитуриентов с приоритетами
+        let query = `
+            SELECT DISTINCT
+                a.id,
+                a.total,
+                a.update_date
+            FROM applicants a
+            INNER JOIN priorities p ON a.id = p.applicant_id
+                                   AND a.update_date = p.update_date
+            WHERE 1=1
+        `;
+        const params = [];
+
+        if (id) {
+            query += ' AND a.id = ?';
+            params.push(parseInt(id));
+        }
+
+        if (score) {
+            query += ' AND a.total >= ?';
+            params.push(parseInt(score));
+        }
+
+        if (date) {
+            query += ' AND a.update_date = ?';
+            params.push(date);
+        }
+
+        // Сортируем по сумме баллов (от большего к меньшему)
+        query += ' ORDER BY a.total DESC, a.id ASC';
+
+        console.log('SQL запрос абитуриентов:', query);
+        console.log('Параметры:', params);
+
+        const [rows] = await pool.query(query, params);
+
+        // Обрабатываем результаты
+        const processedRows = rows.map(row => ({
+            id: row.id,
+            total: Number(row.total) || 0,
+            update_date: row.update_date
+        }));
+
+        console.log(`Найдено ${processedRows.length} уникальных абитуриентов с приоритетами`);
+        res.json(processedRows);
+    } catch (err) {
+        console.error('Ошибка получения списка абитуриентов:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Получение детальной информации об абитуриенте с его приоритетами
+// Получение детальной информации об абитуриенте с его приоритетами
+app.get('/applicant-details', async (req, res) => {
+    const { id } = req.query;
+
+    if (!id) {
+        return res.status(400).json({ error: 'Не указан ID абитуриента' });
+    }
+
+    try {
+        // Получаем основную информацию об абитуриенте
+        const [applicantRows] = await pool.query(
+            `SELECT
+                a.*
+            FROM applicants a
+            INNER JOIN priorities p ON a.id = p.applicant_id
+                                   AND a.update_date = p.update_date
+            WHERE a.id = ?
+            ORDER BY a.update_date DESC
+            LIMIT 1`,
+            [id]
+        );
+
+        if (applicantRows.length === 0) {
+            return res.status(404).json({ error: 'Абитуриент не найден или не имеет приоритетов' });
+        }
+
+        // Получаем приоритеты абитуриента
+        const [priorityRows] = await pool.query(`
+            SELECT
+                p.applicant_id,
+                p.program_code,
+                p.priority,
+                p.update_date,
+                pr.name as program_name
+            FROM priorities p
+            LEFT JOIN programs pr ON p.program_code = pr.code
+            WHERE p.applicant_id = ?
+            ORDER BY p.priority ASC, p.update_date DESC
+        `, [id]);
+
+        res.json({
+            applicant: {
+                ...applicantRows[0],
+                consent: Boolean(applicantRows[0].consent)
+            },
+            priorities: priorityRows
+        });
+
+    } catch (err) {
+        console.error('Ошибка получения деталей абитуриента:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Сервер запущен на порту ${PORT}`);
+  console.log(`✅ Сервер запущен на http://localhost:${PORT}`);
 });
