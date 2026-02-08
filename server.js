@@ -18,15 +18,15 @@ const PORT = 3000;
 
 // Настройка базы данных с поддержкой кириллицы
 const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: '55758690',
-  database: 'admission_db',
-  charset: 'utf8mb4', // Важно для поддержки кириллицы
+  host: process.env.DB_HOST || '95.131.149.21',
+  user: process.env.DB_USER || 'mtkp_tbd_7181_02',
+  password: process.env.DB_PASSWORD || 'O3C1NCcE',
+  database: process.env.DB_NAME || 'mtkp_tbd_7181_02',
+  charset: 'utf8mb4',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  timezone: 'Z' // Фикс проблемы с часовыми поясами при работе с датами
+  timezone: 'Z'
 });
 
 // Middleware
@@ -1479,8 +1479,7 @@ app.get('/applicant-details', async (req, res) => {
     }
 });
 
-// Старт сервера
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Сервер запущен на http://localhost:${PORT}`);
-  console.log(`📁 Рабочая директория: ${__dirname}`);
 });
