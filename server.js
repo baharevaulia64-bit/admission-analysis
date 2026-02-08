@@ -14,7 +14,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
-const PORT = 3000;
+
 
 // Настройка базы данных с поддержкой кириллицы
 const pool = mysql.createPool({
