@@ -1,0 +1,24 @@
+{
+  "name": "admission-analysis",
+  "version": "1.0.0",
+  "description": "ПО для анализа поступления абитуриентов (Олимпиада ИТ)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "docx": "^9.5.1",
+    "express": "^4.19.2",
+    "iconv-lite": "^0.7.2",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.11.3",
+    "pdfkit": "^0.17.2",
+    "pdfkit-table": "^0.1.99",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
