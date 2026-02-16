@@ -14,3 +14,5 @@ docker-compose up -d
 http://localhost:3000/
 
 У вас автоматически развернулась база данных, бэкэнд и фронтенд
+
+Ссылка на видео: https://rutube.ru/video/private/566f1506d0cb3046bf64ebc42efa4bbb/?p=xpuxpaawfYWqDxkkWgFmdg
