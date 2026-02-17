@@ -16,3 +16,5 @@ http://localhost:3000/
 У вас автоматически развернулась база данных, бэкэнд и фронтенд
 
 Ссылка на видео: https://rutube.ru/video/private/566f1506d0cb3046bf64ebc42efa4bbb/?p=xpuxpaawfYWqDxkkWgFmdg
+
+Cсылка на сайт на бесплатном хосте(данные грузятся очень медленно, в отличие от localhost):https://admission-analysis.onrender.com/
